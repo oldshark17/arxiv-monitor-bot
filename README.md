@@ -21,12 +21,15 @@
    ```bash
    git clone [https://github.com/oldshark17/arxiv-monitor-bot.git](https://github.com/oldshark17/arxiv-monitor-bot.git)
    cd arxiv-monitor-bot
+
 **2. Настройте виртуальное окружение:**
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+
 **3. Создайте файл .env и добавьте свои ключи: Создайте файл .env в корне проекта и вставьте туда:**
 TELEGRAM_TOKEN=ваш_токен_бота
 GEMINI_API_KEY=ваш_ключ_gemini
+
 **4. Запустите бота:**
 python3 src/main.py
