@@ -21,7 +21,7 @@
 ```bash
 git clone https://github.com/oldshark17/arxiv-monitor-bot.git
 cd arxiv-monitor-bot
-```bash
+```
 
 2. **Настройте виртуальное окружение:**
 
