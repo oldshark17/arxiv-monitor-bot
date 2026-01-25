@@ -6,14 +6,8 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from google import genai 
-
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
+import arxiv
+from telegraph import Telegraph
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # 1. Настройки и инициализация
@@ -21,62 +15,55 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
-# Настройка клиента Gemini с принудительной версией v1 (чтобы избежать 404)
+# Настройка клиента Gemini
 client = genai.Client(
     api_key=GEMINI_KEY,
     http_options={'api_version': 'v1'}
 )
 
+# Telegraph клиент
+telegraph = Telegraph()
+telegraph.create_account(short_name='ArXivBot')
+
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
-# 2. Функция парсинга ArXiv
-def get_arxiv_articles(query):
-    options = Options()
-    options.add_argument("--headless") 
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-    
-    search_url = f"https://arxiv.org/search/?query={query.replace(' ', '+')}&searchtype=all&sort=-announced_date_first"
+# Хранилище для пагинации (user_id -> {query, offset})
+user_search_state = {}
+
+# 2. Функция поиска статей через ArXiv API
+def get_arxiv_articles(query: str, max_results: int = 5, start: int = 0):
+    """Search arXiv using the official API."""
+    arxiv_client = arxiv.Client()
+    search = arxiv.Search(
+        query=query,
+        max_results=max_results,
+        sort_by=arxiv.SortCriterion.SubmittedDate,
+        sort_order=arxiv.SortOrder.Descending
+    )
     
     articles = []
     try:
-        driver.get(search_url)
-        
-        # Ожидаем появления хотя бы одного результата (до 10 сек)
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "arxiv-result"))
-        )
-        
-        results = driver.find_elements(By.CLASS_NAME, "arxiv-result")[:3]
-        for res in results:
-            title = res.find_element(By.CLASS_NAME, "title").text
-            link = res.find_element(By.CSS_SELECTOR, "p.list-title a").get_attribute("href")
-            
-            # ArXiv часто прячет текст под классами 'abstract-full' или 'abstract-short'
-            # Попробуем достать текст из более надежного места
-            try:
-                # Находим блок с аннотацией
-                abs_element = res.find_element(By.CLASS_NAME, "abstract-full")
-                # Убираем лишнее слово "Abstract" в начале, если оно есть
-                abstract_text = abs_element.text.replace("Abstract:", "").strip()
-            except:
-                abstract_text = "Текст статьи не удалось извлечь автоматически."
-                
-            articles.append({"title": title, "link": link, "abstract": abstract_text})
-    finally:
-        driver.quit()
+        results = list(arxiv_client.results(search))
+        # Manual offset since arxiv library doesn't support start parameter directly
+        for result in results[start:start + max_results]:
+            articles.append({
+                "title": result.title,
+                "link": result.entry_id,
+                "abstract": result.summary,
+                "year": result.published.year if result.published else "N/A",
+                "arxiv_id": result.entry_id.split("/")[-1]
+            })
+    except Exception as e:
+        logging.error(f"ArXiv API error: {e}")
+    
     return articles
 
 # 3. Функция работы с AI
-async def get_summary(text):
+async def get_summary(text: str) -> str:
     prompt = f"Ты — научный ассистент. Переведи на русский и кратко (3-4 предложения) объясни суть этой статьи: {text}"
     try:
-        # Используем стабильную модель 1.5-flash
         response = await asyncio.to_thread(
             client.models.generate_content,
             model="gemini-2.5-flash",
@@ -87,72 +74,118 @@ async def get_summary(text):
         logging.error(f"Gemini Error: {e}")
         return "Не удалось создать описание, но статья доступна по ссылке."
 
-# 4. Вспомогательная функция для поиска и отправки (общая для кнопок и текста)
-async def process_search(message: types.Message, query: str):
-    status_msg = await message.answer(f"🔎 Ищу статьи по теме: **{query}**...")
+# 4. Создание Telegraph страницы для статьи
+async def create_telegraph_page(article: dict) -> str:
+    """Create a Telegraph page for an article with Russian summary."""
+    summary = await get_summary(article['abstract'])
+    
+    # HTML контент для Telegraph
+    content = f"""
+    <p><b>Год публикации:</b> {article['year']}</p>
+    <p><b>Краткое содержание:</b></p>
+    <p>{summary}</p>
+    <p><a href="{article['link']}">📄 Открыть оригинал на arXiv</a></p>
+    """
+    
     try:
-        articles = get_arxiv_articles(query)
+        response = telegraph.create_page(
+            title=article['title'][:256],  # Telegraph title limit
+            html_content=content,
+            author_name="ArXiv Monitor Bot"
+        )
+        return response['url']
+    except Exception as e:
+        logging.error(f"Telegraph error: {e}")
+        return article['link']  # Fallback to arXiv link
+
+# 5. Функция поиска и отправки результатов
+async def process_search(message: types.Message, query: str, offset: int = 0):
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    
+    # Сохраняем состояние поиска
+    user_search_state[user_id] = {"query": query, "offset": offset}
+    
+    if offset == 0:
+        status_msg = await message.answer(f"🔎 Ищу статьи по теме: {query}...")
+    else:
+        status_msg = await message.answer("🔄 Загружаю ещё статьи...")
+    
+    try:
+        # Fetch more than needed to check if there are more results
+        articles = get_arxiv_articles(query, max_results=6, start=offset)
+        
         if not articles:
             await status_msg.edit_text("❌ По этой теме ничего не найдено.")
             return
-
-        for art in articles:
-            summary = await get_summary(art['abstract'])
-            response_text = (
-                f"📄 **{art['title']}**\n\n"
-                f"🤖 **Суть:** {summary}\n\n"
-                f"🔗 [Открыть оригинал]({art['link']})"
-            )
-            # Отправляем без parse_mode, чтобы избежать ошибок с символами
-            await message.answer(response_text)
-            
+        
+        has_more = len(articles) > 5
+        articles_to_show = articles[:5]
+        
+        # Создаём Telegraph страницы для каждой статьи
+        telegraph_urls = []
+        for art in articles_to_show:
+            url = await create_telegraph_page(art)
+            telegraph_urls.append(url)
+        
+        # Формируем сообщение со списком статей
+        result_lines = [f"📚 Найдено по запросу: {query}\n"]
+        for i, (art, url) in enumerate(zip(articles_to_show, telegraph_urls), 1):
+            result_lines.append(f"{i}. <a href=\"{url}\">{art['title']}</a> ({art['year']})")
+        
+        result_text = "\n".join(result_lines)
+        
+        # Добавляем кнопку "Загрузить ещё" если есть ещё результаты
+        builder = InlineKeyboardBuilder()
+        if has_more:
+            new_offset = offset + 5
+            builder.button(text="📥 Загрузить ещё", callback_data=f"more_{new_offset}")
+        
         await status_msg.delete()
+        await message.answer(
+            result_text, 
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=builder.as_markup() if has_more else None
+        )
+        
+        # Обновляем offset
+        user_search_state[user_id]["offset"] = offset + 5
+        
     except Exception as e:
         logging.error(f"Search processing error: {e}")
         await message.answer("⚠️ Произошла ошибка при поиске.")
 
-# 5. Обработчики команд и сообщений
+# 6. Обработчики команд и сообщений
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    builder = InlineKeyboardBuilder()
-    
-    # Список готовых тем
-    topics = {
-        "🤖 AI / ML": "Artificial Intelligence",
-        "🧬 Bio-AI": "Biology Intelligence",
-        "🔐 Security": "Cybersecurity",
-        "⚛️ Physics": "Quantum Physics"
-    }
-    
-    for text, query in topics.items():
-        builder.button(text=text, callback_data=f"topic_{query}")
-    
-    builder.button(text="🔍 Свой запрос (напиши текстом)", callback_data="manual_info")
-    builder.adjust(2, 2, 1) # Сетка кнопок
-    
     await message.answer(
-        "👋 **Добро пожаловать в ArXiv Monitor!**\n\n"
-        "Выберите одну из популярных тем или просто напишите мне свой запрос на английском.",
-        reply_markup=builder.as_markup()
+        "� Привет! Я помогу найти научные статьи на arXiv.\n\n"
+        "Просто напиши тему поиска (на английском), например:\n"
+        "• machine learning\n"
+        "• quantum computing\n"
+        "• neural networks"
     )
 
-@dp.callback_query(F.data.startswith("topic_"))
-async def handle_topic(callback: types.CallbackQuery):
-    query = callback.data.split("_")[1]
-    await process_search(callback.message, query)
+@dp.callback_query(F.data.startswith("more_"))
+async def handle_load_more(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if user_id not in user_search_state:
+        await callback.answer("Сессия истекла. Введите запрос заново.")
+        return
+    
+    offset = int(callback.data.split("_")[1])
+    query = user_search_state[user_id]["query"]
+    
     await callback.answer()
-
-@dp.callback_query(F.data == "manual_info")
-async def handle_manual(callback: types.CallbackQuery):
-    await callback.message.answer("⌨️ Просто напиши мне тему (на английском), например: `Black Holes`.")
-    await callback.answer()
+    await process_search(callback.message, query, offset)
 
 @dp.message()
 async def handle_text(message: types.Message):
-    # Любой текст от пользователя считается конкретной темой для поиска
+    # Любой текст от пользователя считается темой для поиска
     await process_search(message, message.text)
 
-# 6. Запуск
+# 7. Запуск
 async def main():
     print("Бот в сети!")
     await dp.start_polling(bot)
