@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from google import genai 
+from google import genai
 import arxiv
 from telegraph import Telegraph
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -35,8 +35,10 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
-# Хранилище для пагинации и статей (user_id -> {query, offset, articles})
+# Хранилище для пагинации: user_id -> {query, offset}
 user_search_state = {}
+# Глобальное хранилище статей: arxiv_id -> article_data
+articles_storage = {}
 
 # FSM состояния для создания подписки
 class SubscriptionStates(StatesGroup):
@@ -48,20 +50,30 @@ ARXIV_NO_UPDATE_DAYS = {4, 5}  # Friday, Saturday
 ARXIV_UPDATE_HOUR = 6  # 06:00 local time when new papers appear
 
 # 2. Функция поиска статей через ArXiv API
-def get_arxiv_articles(query: str, max_results: int = 5, start: int = 0):
-    """Search arXiv using the official API."""
+def get_arxiv_articles(query: str, max_results: int = 5, offset: int = 0):
+    """Search arXiv using the official API with pagination.
+
+    Returns:
+        tuple: (articles_list, has_next_page)
+    """
     arxiv_client = arxiv.Client()
+    # Search in title and abstract for better relevance
+    # Use "ti:query OR abs:query" to find papers about the topic
+    formatted_query = f"ti:{query} OR abs:{query}"
     search = arxiv.Search(
-        query=query,
-        max_results=max_results + start,  # Fetch enough to skip
+        query=formatted_query,
+        max_results=100,  # Large limit for generator
         sort_by=arxiv.SortCriterion.SubmittedDate,
         sort_order=arxiv.SortOrder.Descending
     )
-    
+
     articles = []
     try:
-        results = list(arxiv_client.results(search))
-        for result in results[start:start + max_results]:
+        # Use offset parameter with generator
+        results_generator = arxiv_client.results(search, offset=offset)
+
+        # Fetch max_results + 1 to check if there are more pages
+        for i, result in enumerate(results_generator):
             articles.append({
                 "title": result.title,
                 "link": result.entry_id,
@@ -69,135 +81,138 @@ def get_arxiv_articles(query: str, max_results: int = 5, start: int = 0):
                 "year": result.published.year if result.published else "N/A",
                 "arxiv_id": result.entry_id.split("/")[-1]
             })
+            if len(articles) >= max_results + 1:
+                break
     except Exception as e:
         logging.error(f"ArXiv API error: {e}")
-    
-    return articles
 
-# 3. Функция работы с AI
-async def get_summary(text: str) -> str:
+    # Check if there are more pages
+    has_next = len(articles) > max_results
+    current_batch = articles[:max_results]
+
+    # Store articles in global storage
+    for art in current_batch:
+        articles_storage[art['arxiv_id']] = art
+
+    return current_batch, has_next
+
+# 3. Создание Telegraph страницы для статьи
+async def create_telegraph_page(article: dict) -> str:
+    """Create a Telegraph page for an article with Russian summary."""
+    # Запрос к Gemini
     prompt = (
-        "Ты — научный ассистент. Напиши краткое содержание статьи на русском языке.\n\n"
-        "Требования:\n"
-        "- 3-5 предложений\n"
-        "- Простым языком, понятным неспециалисту\n"
-        "- Основная идея, метод и результат\n\n"
-        f"Абстракт статьи:\n{text}"
+        f"Ты эксперт-ученый. Переведи на русский и сделай краткий пересказ статьи '{article['title']}'. "
+        f"Используй HTML-теги <b>, <i>, <ul>, <li>. Опиши суть, методы и результат. "
+        f"Абстракт статьи: {article['abstract']}"
     )
+
     try:
         response = await asyncio.to_thread(
             client.models.generate_content,
             model="gemini-2.5-flash",
             contents=prompt
         )
-        return response.text
-    except Exception as e:
-        logging.error(f"Gemini Error: {e}")
-        return "Не удалось создать описание, но статья доступна по ссылке."
 
-# 4. Создание Telegraph страницы для статьи
-async def create_telegraph_page(article: dict) -> str:
-    """Create a Telegraph page for an article with Russian summary."""
-    summary = await get_summary(article['abstract'])
-    
-    content = f"""
-    <p><b>Год публикации:</b> {article['year']}</p>
-    <p><b>Краткое содержание:</b></p>
-    <p>{summary}</p>
-    <p><a href="{article['link']}">📄 Открыть оригинал на arXiv</a></p>
-    """
-    
-    try:
-        response = telegraph.create_page(
-            title=article['title'][:256],
-            html_content=content,
-            author_name="ArXiv Monitor Bot"
+        # Очистка текста для Telegraph
+        summary_clean = response.text.replace("```html", "").replace("```", "").strip()
+        summary_html = summary_clean.replace('\n', '<br>')
+
+        # Создание страницы
+        page = telegraph.create_page(
+            title=article['title'][:50],
+            html_content=f"<h4>{article['title']}</h4><hr>{summary_html}<br><br><a href='{article['link']}'>Источник (arXiv)</a>"
         )
-        return response['url']
+
+        return page['url']
     except Exception as e:
-        logging.error(f"Telegraph error: {e}")
+        logging.error(f"Telegraph/Gemini error: {e}")
         return article['link']
 
-# 5. Функция поиска и отправки результатов (lazy loading)
-async def process_search(message: types.Message, query: str, offset: int = 0):
-    user_id = message.from_user.id if message.from_user else message.chat.id
-    
-    if offset == 0:
-        status_msg = await message.answer(f"🔎 Ищу статьи по теме: {query}...")
-    else:
-        status_msg = await message.answer("🔄 Загружаю ещё статьи...")
-    
-    try:
-        articles = get_arxiv_articles(query, max_results=6, start=offset)
-        
-        if not articles:
-            await status_msg.edit_text("❌ По этой теме ничего не найдено.")
-            return
-        
-        has_more = len(articles) > 5
-        articles_to_show = articles[:5]
-        
-        # Сохраняем статьи для lazy loading
-        user_search_state[user_id] = {
-            "query": query,
-            "offset": offset,
-            "articles": {i: art for i, art in enumerate(articles_to_show)}
-        }
-        
-        # Формируем сообщение со списком
-        result_lines = [f"📚 Найдено по запросу: {query}\n"]
-        for i, art in enumerate(articles_to_show):
-            result_lines.append(f"{i+1}. {art['title'][:80]}{'...' if len(art['title']) > 80 else ''} ({art['year']})")
-        
-        result_lines.append("\n👆 Нажмите на номер статьи для просмотра:")
-        result_text = "\n".join(result_lines)
-        
-        # Кнопки для каждой статьи
-        builder = InlineKeyboardBuilder()
-        for i in range(len(articles_to_show)):
-            builder.button(text=f"📄 {i+1}", callback_data=f"article_{i}")
-        builder.adjust(5)  # 5 кнопок в ряд
-        
-        if has_more:
-            new_offset = offset + 5
-            builder.button(text="📥 Загрузить ещё", callback_data=f"more_{new_offset}")
-        
-        await status_msg.delete()
-        await message.answer(
+# 5. Функция поиска и отправки результатов
+async def display_search_results(target, query: str, offset: int = 0, is_edit: bool = False):
+    """Display search results. Can either send new message or edit existing."""
+    user_id = target.from_user.id if hasattr(target, 'from_user') else target.chat.id
+
+    # Run blocking arXiv API in thread
+    loop = asyncio.get_event_loop()
+    articles, has_next = await loop.run_in_executor(
+        None, get_arxiv_articles, query, 5, offset
+    )
+
+    if not articles and offset == 0:
+        text = "❌ По этой теме ничего не найдено."
+        if is_edit:
+            await target.edit_text(text)
+        else:
+            await target.answer(text)
+        return
+
+    # Build response text
+    result_lines = [f"📚 <b>Тема:</b> {query}"]
+    result_lines.append(f"Показаны статьи {offset + 1} — {offset + len(articles)}\n")
+
+    builder = InlineKeyboardBuilder()
+    for i, art in enumerate(articles):
+        num = offset + i + 1
+        # Button references article by arxiv_id
+        builder.button(text=f"📄 {num}", callback_data=f"article_{art['arxiv_id']}")
+        result_lines.append(f"{num}. {art['title'][:80]}{'...' if len(art['title']) > 80 else ''} ({art['year']})")
+
+    result_lines.append("\n👆 Нажмите на номер статьи для просмотра")
+    result_text = "\n".join(result_lines)
+
+    builder.adjust(5)  # 5 buttons per row
+
+    # Navigation buttons
+    nav_buttons = []
+    if offset > 0:
+        nav_buttons.append(("◀️ Назад", f"nav_{offset - 5}"))
+    if has_next:
+        nav_buttons.append(("▶️ Вперёд", f"nav_{offset + 5}"))
+
+    if nav_buttons:
+        for text, callback in nav_buttons:
+            builder.button(text=text, callback_data=callback)
+        builder.adjust(5, len(nav_buttons))  # Articles in row of 5, nav buttons below
+
+    # Save session state
+    user_search_state[user_id] = {
+        "query": query,
+        "offset": offset
+    }
+
+    # Send or edit message
+    if is_edit:
+        await target.edit_text(
             result_text,
+            parse_mode="HTML",
             reply_markup=builder.as_markup()
         )
-        
-        user_search_state[user_id]["offset"] = offset + 5
-        
-    except Exception as e:
-        logging.error(f"Search processing error: {e}")
-        await message.answer("⚠️ Произошла ошибка при поиске.")
+    else:
+        await target.answer(
+            result_text,
+            parse_mode="HTML",
+            reply_markup=builder.as_markup()
+        )
 
 # 6. Обработчик клика по статье (lazy Telegraph creation)
 @dp.callback_query(F.data.startswith("article_"))
 async def handle_article_click(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    article_idx = int(callback.data.replace("article_", ""))
-    
-    if user_id not in user_search_state or "articles" not in user_search_state[user_id]:
-        await callback.answer("Сессия истекла. Выполните поиск заново.")
+    arxiv_id = callback.data.replace("article_", "")
+
+    article = articles_storage.get(arxiv_id)
+    if not article:
+        await callback.answer("Статья не найдена. Выполните поиск заново.", show_alert=True)
         return
-    
-    articles = user_search_state[user_id]["articles"]
-    if article_idx not in articles:
-        await callback.answer("Статья не найдена.")
-        return
-    
-    article = articles[article_idx]
+
     await callback.answer("⏳ Генерирую краткое содержание...")
-    
+
     # Создаём Telegraph страницу только сейчас
     url = await create_telegraph_page(article)
-    
+
     await callback.message.answer(
         f"📄 <b>{article['title']}</b>\n\n"
-        f"<a href=\"{url}\">� Краткое содержание</a>\n"
+        f"<a href=\"{url}\">📖 Краткое содержание</a>\n"
         f"<a href=\"{article['link']}\">📎 Оригинал на arXiv</a>",
         parse_mode="HTML",
         disable_web_page_preview=True
@@ -211,7 +226,7 @@ def get_main_menu():
     builder.adjust(1)
     return builder.as_markup()
 
-# 7. Обработчики команд
+# 8. Обработчики команд
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     db.add_user(message.from_user.id)
@@ -245,14 +260,14 @@ async def handle_search_mode(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-# 8. Обработчики подписок
+# 9. Обработчики подписок
 @dp.callback_query(F.data == "subscriptions")
 async def handle_subscriptions(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     subs = db.get_subscriptions(user_id)
-    
+
     builder = InlineKeyboardBuilder()
-    
+
     if subs:
         text = "📬 Ваши подписки:\n\n"
         for sub in subs:
@@ -265,21 +280,21 @@ async def handle_subscriptions(callback: types.CallbackQuery):
             builder.button(text=f"❌ {sub['topic'][:20]}", callback_data=f"delete_sub_{sub['id']}")
     else:
         text = "📬 У вас пока нет подписок.\n\nСоздайте подписку, чтобы получать уведомления о новых статьях!"
-    
+
     builder.button(text="➕ Добавить подписку", callback_data="add_subscription")
     builder.button(text="◀️ Назад", callback_data="main_menu")
     builder.adjust(1)
-    
+
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
 @dp.callback_query(F.data == "add_subscription")
 async def handle_add_subscription(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(SubscriptionStates.waiting_for_topic)
-    
+
     builder = InlineKeyboardBuilder()
     builder.button(text="◀️ Отмена", callback_data="subscriptions")
-    
+
     await callback.message.edit_text(
         "✏️ Введите тему для подписки (на английском):\n\n"
         "Например: deep learning, black holes, CRISPR",
@@ -291,11 +306,11 @@ async def handle_add_subscription(callback: types.CallbackQuery, state: FSMConte
 async def process_subscription_topic(message: types.Message, state: FSMContext):
     topic = message.text.strip()
     user_id = message.from_user.id
-    
+
     # Создаём подписку сразу (ежедневная проверка)
     db.add_subscription(user_id, topic, "daily")
     await state.clear()
-    
+
     await message.answer(
         f"✅ Подписка создана!\n\n"
         f"📌 Тема: {topic}\n\n"
@@ -313,80 +328,79 @@ async def process_subscription_topic(message: types.Message, state: FSMContext):
 async def handle_delete_subscription(callback: types.CallbackQuery):
     sub_id = int(callback.data.replace("delete_sub_", ""))
     db.delete_subscription(sub_id)
-    
+
     await callback.answer("Подписка удалена!")
-    
+
     # Refresh subscription list
     await handle_subscriptions(callback)
 
-# 9. Обработчик загрузки дополнительных статей
-@dp.callback_query(F.data.startswith("more_"))
-async def handle_load_more(callback: types.CallbackQuery):
+# 10. Обработчик навигации (вперёд/назад)
+@dp.callback_query(F.data.startswith("nav_"))
+async def handle_navigation(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    
-    if user_id not in user_search_state:
-        await callback.answer("Сессия истекла. Введите запрос заново.")
-        return
-    
-    offset = int(callback.data.split("_")[1])
-    query = user_search_state[user_id]["query"]
-    
-    await callback.answer()
-    await process_search(callback.message, query, offset)
 
-# 10. Обработчик текстовых сообщений (поиск)
+    if user_id not in user_search_state:
+        await callback.answer("Сессия истекла. Введите запрос заново.", show_alert=True)
+        return
+
+    offset = int(callback.data.replace("nav_", ""))
+    query = user_search_state[user_id]["query"]
+
+    await callback.answer()
+    await display_search_results(callback.message, query, offset, is_edit=True)
+
+# 11. Обработчик текстовых сообщений (поиск)
 @dp.message()
 async def handle_text(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
-    
+
     # Если не в FSM состоянии — это поиск
     if current_state is None:
-        await process_search(message, message.text)
+        await display_search_results(message, message.text, offset=0)
 
-# 11. Фоновая задача мониторинга
+# 12. Фоновая задача мониторинга
 async def check_subscriptions(force: bool = False):
     """Проверка подписок и отправка новых статей.
-    
+
     Args:
         force: If True, bypass all checks (for testing)
     """
     now = datetime.now()
-    
+
     # Пропускаем пятницу и субботу — arXiv не обновляется
     if not force and now.weekday() in ARXIV_NO_UPDATE_DAYS:
         logging.info("Пропуск проверки: arXiv не обновляется в ПТ/СБ")
         return
-    
+
     # Проверяем только после 06:00 (когда новые статьи уже опубликованы)
     if not force and now.hour < ARXIV_UPDATE_HOUR:
         logging.info(f"Пропуск проверки: ещё рано ({now.hour}:00 < {ARXIV_UPDATE_HOUR}:00)")
         return
-    
+
     logging.info("Запуск проверки подписок...")
-    
+
     subscriptions = db.get_all_subscriptions()
-    
+
     for sub in subscriptions:
         try:
-            # Проверяем, прошло ли 24 часа с последней проверки
+            # Проверяем, не проверяли ли мы уже сегодня
             if not force:
                 last_checked = sub['last_checked']
                 if last_checked:
                     last_dt = datetime.fromisoformat(last_checked)
-                    hours_since_last = (now - last_dt).total_seconds() / 3600
-                    
-                    if hours_since_last < 24:
-                        continue  # Ещё не время
-            
-            # Ищем новые статьи
-            articles = get_arxiv_articles(sub['topic'], max_results=5)
-            
+                    # Если уже проверяли сегодня - пропускаем
+                    if last_dt.date() == now.date():
+                        continue  # Уже проверяли сегодня
+
+            # Ищем новые статьи (returns tuple now)
+            articles, _ = get_arxiv_articles(sub['topic'], max_results=5)
+
             # Фильтруем уже отправленные
             new_articles = []
             for art in articles:
                 if not db.is_paper_seen(sub['user_id'], art['arxiv_id']):
                     new_articles.append(art)
-            
+
             if new_articles:
                 # Отправляем уведомление с новыми статьями
                 telegraph_urls = []
@@ -394,11 +408,11 @@ async def check_subscriptions(force: bool = False):
                     url = await create_telegraph_page(art)
                     telegraph_urls.append(url)
                     db.mark_paper_seen(sub['user_id'], sub['id'], art['arxiv_id'])
-                
+
                 result_lines = [f"🔔 Новые статьи по теме: {sub['topic']}\n"]
                 for art, url in zip(new_articles[:3], telegraph_urls):
                     result_lines.append(f"• <a href=\"{url}\">{art['title']}</a> ({art['year']})")
-                
+
                 await bot.send_message(
                     sub['user_id'],
                     "\n".join(result_lines),
@@ -411,23 +425,23 @@ async def check_subscriptions(force: bool = False):
                     sub['user_id'],
                     f"📭 По теме «{sub['topic']}» новых статей пока нет."
                 )
-            
+
             # Обновляем время проверки
             db.update_last_checked(sub['id'])
-            
+
         except Exception as e:
             logging.error(f"Ошибка проверки подписки {sub['id']}: {e}")
 
-# 12. Запуск
+# 13. Запуск
 async def main():
     # Инициализация БД
     db.init_db()
-    
+
     # Запуск планировщика (каждый час в :00)
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_subscriptions, 'cron', minute=0)
     scheduler.start()
-    
+
     print("Бот в сети!")
     await dp.start_polling(bot)
 
